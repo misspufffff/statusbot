@@ -1,6 +1,6 @@
-import requests
 import os
 import json
+import requests
 from flask import Flask, request
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
@@ -9,13 +9,10 @@ from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 
 # ─── Slack Client ─────────────────────────────────────────────────────────────
-
 SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
 slack = WebClient(token=SLACK_BOT_TOKEN)
 
 # ─── Google API Clients ───────────────────────────────────────────────────────
-
-# Load your service account key (mounted by Render as a secret file)
 with open("service-account.json") as f:
     sa_info = json.load(f)
 
@@ -27,34 +24,23 @@ creds = Credentials.from_service_account_info(sa_info, scopes=SCOPES)
 drive_service = build("drive", "v3", credentials=creds)
 docs_service  = build("docs", "v1", credentials=creds)
 
-# The ID of your template doc (set this in Render’s env vars)
 TEMPLATE_DOC_ID = os.environ["TEMPLATE_DOC_ID"]
-# (Optional) a parent folder ID if you want all copies in one folder:
-# PARENT_FOLDER_ID = os.environ.get("PARENT_FOLDER_ID")
-
+# (Optional) PARENT_FOLDER_ID = os.environ.get("PARENT_FOLDER_ID")
 
 # ─── Drive/Docs Helper Functions ─────────────────────────────────────────────
-
 def find_doc_id_by_title(title):
-    """Search Drive for a Google Doc named exactly `title`."""
     q = f"name = '{title}' and mimeType = 'application/vnd.google-apps.document'"
     resp = drive_service.files().list(q=q, fields="files(id)").execute()
     files = resp.get("files", [])
     return files[0]["id"] if files else None
 
 def copy_project_doc(title):
-    """Copy the template and name it `title`, return new doc’s ID."""
     body = {"name": title}
-    # If you want to put it into a specific folder:
-    # body["parents"] = [PARENT_FOLDER_ID]
+    # body["parents"] = [PARENT_FOLDER_ID]  # if you want a folder
     new = drive_service.files().copy(fileId=TEMPLATE_DOC_ID, body=body).execute()
     return new["id"]
 
 def append_update_to_doc(doc_id, cells):
-    """
-    Insert a new row at rowIndex=1 (below header) and fill with `cells` list.
-    `cells` should match the table’s number of columns.
-    """
     requests = [
         {
             "insertTableRow": {
@@ -66,25 +52,18 @@ def append_update_to_doc(doc_id, cells):
             }
         }
     ]
-    # For each cell, insertText into the newly created empty cell:
-    for i, text in enumerate(cells):
+    for text in cells:
         requests.append({
             "insertText": {
-                "location": {
-                    "index": None,       # Docs API will place at start of cell
-                    "segmentId": ""
-                },
+                "location": {"index": None, "segmentId": ""},
                 "text": text
             }
         })
     docs_service.documents().batchUpdate(
-        documentId=doc_id,
-        body={"requests": requests}
+        documentId=doc_id, body={"requests": requests}
     ).execute()
 
-
 # ─── Flask App & Slack Endpoints ──────────────────────────────────────────────
-
 app = Flask(__name__)
 
 @app.route("/slack/command", methods=["POST"])
@@ -93,24 +72,24 @@ def slack_command():
     trigger_id = request.form["trigger_id"]
     channel_id = request.form["channel_id"]
 
-    # Fetch active Harvest projects
-harvest_url = "https://api.harvestapp.com/v2/projects"
-headers = {
-    "Harvest-Account-Id": os.environ["HARVEST_ACCOUNT_ID"],
-    "Authorization":      f"Bearer {os.environ['HARVEST_ACCESS_TOKEN']}",
-    "User-Agent":         "StatusBot (mclaypoole@kickrdesign.com)"
-}
-resp = requests.get(harvest_url, headers=headers)
-resp.raise_for_status()
-projects = resp.json().get("projects", [])
-
-project_options = [
-    {
-      "text":  {"type": "plain_text", "text": proj["name"]},
-      "value": proj["name"]
+    # Fetch Harvest projects
+    harvest_url = "https://api.harvestapp.com/v2/projects"
+    headers = {
+        "Harvest-Account-Id": os.environ["HARVEST_ACCOUNT_ID"],
+        "Authorization":      f"Bearer {os.environ['HARVEST_ACCESS_TOKEN']}",
+        "User-Agent":         "StatusBot (mclaypoole@kickrdesign.com)"
     }
-    for proj in projects
-]
+    resp = requests.get(harvest_url, headers=headers)
+    resp.raise_for_status()
+    projects = resp.json().get("projects", [])
+
+    project_options = [
+        {
+            "text":  {"type": "plain_text", "text": proj["name"]},
+            "value": proj["name"]
+        }
+        for proj in projects
+    ]
 
     slack.views_open(
         trigger_id=trigger_id,
@@ -122,7 +101,6 @@ project_options = [
             "submit": {"type": "plain_text", "text": "Submit"},
             "close": {"type": "plain_text", "text": "Cancel"},
             "blocks": [
-                # Project selector
                 {
                     "type": "input",
                     "block_id": "project",
@@ -133,22 +111,19 @@ project_options = [
                         "options": project_options
                     }
                 },
-                # Week of Monday header (display only)
                 {
                     "type": "section",
                     "text": {
                         "type": "mrkdwn",
-                        "text": f"*Week of { (datetime.now() - timedelta(days=datetime.now().weekday())).strftime('%B %d, %Y') }*"
+                        "text": f"*Week of {(datetime.now() - timedelta(days=datetime.now().weekday())).strftime('%B %d, %Y')}*"
                     }
                 },
-                # Your Name
                 {
                     "type": "input",
                     "block_id": "name",
                     "label": {"type": "plain_text", "text": "Your Name"},
                     "element": {"type": "plain_text_input", "action_id": "name_input"}
                 },
-                # Discipline
                 {
                     "type": "input",
                     "block_id": "discipline",
@@ -163,7 +138,6 @@ project_options = [
                         ]
                     }
                 },
-                # The four questions
                 *[
                     {
                         "type": "input",
@@ -183,7 +157,6 @@ project_options = [
     )
     return "", 200
 
-
 @app.route("/slack/interact", methods=["POST"])
 def slack_interact():
     """Handle modal submission: write to Doc + post to Slack."""
@@ -201,17 +174,13 @@ def slack_interact():
     feedback     = vals["feedback"]["feedback_input"]["value"]
     next_steps   = vals["next_steps"]["next_steps_input"]["value"]
 
-    # 1) Look up or create the project doc
     doc_id = find_doc_id_by_title(project_name)
     if not doc_id:
         doc_id = copy_project_doc(project_name)
 
-    # 2) Append a new row
     append_update_to_doc(doc_id, [name, discipline, progress, challenges, feedback, next_steps])
 
-    # 3) Post a confirmation back to Slack
-    monday_str = (datetime.now() - timedelta(days=datetime.now().weekday())) \
-                  .strftime("Week of %B %d, %Y")
+    monday_str = (datetime.now() - timedelta(days=datetime.now().weekday())).strftime("Week of %B %d, %Y")
     slack_msg = (
         f"*Weekly Update – {project_name} ({monday_str})*\n"
         f"> *Name:* {name}\n"
@@ -228,7 +197,5 @@ def slack_interact():
 
     return "", 200
 
-
 if __name__ == "__main__":
-    # Render uses port 10000 by default; adjust if needed
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "10000")))
