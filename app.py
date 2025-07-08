@@ -1,3 +1,4 @@
+import requests
 import os
 import json
 from flask import Flask, request
@@ -92,19 +93,24 @@ def slack_command():
     trigger_id = request.form["trigger_id"]
     channel_id = request.form["channel_id"]
 
-    # TODO: Replace this static list with a real Harvest API call
-    harvest_projects = [
-        {"name": "Project Alpha"},
-        {"name": "Project Beta"},
-        {"name": "Project Gamma"},
-    ]
-    project_options = [
-        {
-            "text": {"type": "plain_text", "text": p["name"]},
-            "value": p["name"]
-        }
-        for p in harvest_projects
-    ]
+    # Fetch active Harvest projects
+harvest_url = "https://api.harvestapp.com/v2/projects"
+headers = {
+    "Harvest-Account-Id": os.environ["HARVEST_ACCOUNT_ID"],
+    "Authorization":      f"Bearer {os.environ['HARVEST_ACCESS_TOKEN']}",
+    "User-Agent":         "StatusBot (mclaypoole@kickrdesign.com)"
+}
+resp = requests.get(harvest_url, headers=headers)
+resp.raise_for_status()
+projects = resp.json().get("projects", [])
+
+project_options = [
+    {
+      "text":  {"type": "plain_text", "text": proj["name"]},
+      "value": proj["name"]
+    }
+    for proj in projects
+]
 
     slack.views_open(
         trigger_id=trigger_id,
