@@ -1,7 +1,7 @@
 import os
 import json
 import requests
-from flask import Flask, request
+from flask import Flask, request, jsonify
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 from datetime import datetime, timedelta
@@ -25,9 +25,8 @@ drive_service = build("drive", "v3", credentials=creds)
 docs_service  = build("docs", "v1", credentials=creds)
 
 TEMPLATE_DOC_ID = os.environ["TEMPLATE_DOC_ID"]
-# (Optional) PARENT_FOLDER_ID = os.environ.get("PARENT_FOLDER_ID")
 
-# ─── Drive/Docs Helper Functions ─────────────────────────────────────────────
+# ─── Drive/Docs Helpers ──────────────────────────────────────────────────────
 def find_doc_id_by_title(title):
     q = f"name = '{title}' and mimeType = 'application/vnd.google-apps.document'"
     resp = drive_service.files().list(q=q, fields="files(id)").execute()
@@ -35,24 +34,22 @@ def find_doc_id_by_title(title):
     return files[0]["id"] if files else None
 
 def copy_project_doc(title):
-    body = {"name": title}
-    # body["parents"] = [PARENT_FOLDER_ID]  # if you want to organize copies in a folder
-    new = drive_service.files().copy(fileId=TEMPLATE_DOC_ID, body=body).execute()
+    new = drive_service.files().copy(
+        fileId=TEMPLATE_DOC_ID,
+        body={"name": title}
+    ).execute()
     return new["id"]
 
 def append_update_to_doc(doc_id, cells):
-    # Insert a new row below the header (rowIndex=1) and fill with cells
-    requests = [
-        {
-            "insertTableRow": {
-                "tableCellLocation": {
-                    "tableStartLocation": {"index": 1},
-                    "rowIndex": 1
-                },
-                "insertBelow": True
-            }
+    requests = [{
+        "insertTableRow": {
+            "tableCellLocation": {
+                "tableStartLocation": {"index": 1},
+                "rowIndex": 1
+            },
+            "insertBelow": True
         }
-    ]
+    }]
     for text in cells:
         requests.append({
             "insertText": {
@@ -61,20 +58,17 @@ def append_update_to_doc(doc_id, cells):
             }
         })
     docs_service.documents().batchUpdate(
-        documentId=doc_id,
-        body={"requests": requests}
+        documentId=doc_id, body={"requests": requests}
     ).execute()
 
-# ─── Flask App & Slack Endpoints ──────────────────────────────────────────────
+# ─── Flask App ────────────────────────────────────────────────────────────────
 app = Flask(__name__)
 
-@app.route("/slack/command", methods=["POST"])
-def slack_command():
-    """Slash command: /weekly-update → open a modal with all Harvest projects."""
-    trigger_id = request.form["trigger_id"]
-    channel_id = request.form["channel_id"]
+# Caches the full list of Harvest project names in memory
+HARVEST_PROJECTS = []
 
-    # Paginate through Harvest projects (up to any number)
+def load_all_harvest_projects():
+    global HARVEST_PROJECTS
     harvest_url = "https://api.harvestapp.com/v2/projects"
     headers = {
         "Harvest-Account-Id": os.environ["HARVEST_ACCOUNT_ID"],
@@ -84,18 +78,41 @@ def slack_command():
     projects = []
     page = 1
     while True:
-        resp = requests.get(harvest_url, headers=headers, params={"page": page, "per_page": 100})
-        resp.raise_for_status()
-        data = resp.json()
-        projects.extend(data.get("projects", []))
+        r = requests.get(harvest_url, headers=headers,
+                         params={"page": page, "per_page": 100})
+        r.raise_for_status()
+        data = r.json()
+        projects.extend([p["name"] for p in data.get("projects", [])])
         if not data.get("next_page"):
             break
         page += 1
+    HARVEST_PROJECTS = projects
 
-    project_options = [
-        {"text": {"type": "plain_text", "text": p["name"]}, "value": p["name"]}
-        for p in projects
-    ]
+@app.before_first_request
+def init_projects():
+    load_all_harvest_projects()
+
+@app.route("/slack/options", methods=["POST"])
+def slack_options():
+    """Provide dynamic project suggestions for external_select."""
+    payload = json.loads(request.form["payload"])
+    user_input = payload.get("value", "").lower()
+    # filter project names by substring match
+    matches = [p for p in HARVEST_PROJECTS if user_input in p.lower()]
+    options = [{
+        "text": {"type": "plain_text", "text": name},
+        "value": name
+    } for name in matches[:100]]  # Slack caps at 100
+    return jsonify(options=options)
+
+@app.route("/slack/command", methods=["POST"])
+def slack_command():
+    """Open modal with external_select for unlimited projects."""
+    trigger_id = request.form["trigger_id"]
+    channel_id = request.form["channel_id"]
+
+    week_of = (datetime.now() - timedelta(days=datetime.now().weekday())) \
+               .strftime("%B %d, %Y")
 
     slack.views_open(
         trigger_id=trigger_id,
@@ -107,51 +124,41 @@ def slack_command():
             "submit": {"type": "plain_text", "text": "Submit"},
             "close": {"type": "plain_text", "text": "Cancel"},
             "blocks": [
-                # Project selector
                 {
                     "type": "input",
                     "block_id": "project",
                     "label": {"type": "plain_text", "text": "Project"},
                     "element": {
-                        "type": "static_select",
+                        "type": "external_select",
                         "action_id": "project_select",
-                        "options": project_options
+                        "min_query_length": 0,
+                        "placeholder": {"type": "plain_text", "text": "Type to search…"}
                     }
                 },
-                # Week-of-Monday header (display only)
                 {
                     "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": f"*Week of {(datetime.now() - timedelta(days=datetime.now().weekday())).strftime('%B %d, %Y')}*"
-                    }
+                    "text": {"type": "mrkdwn", "text": f"*Week of {week_of}*"}
                 },
-                # Your Name
                 {
                     "type": "input",
                     "block_id": "name",
                     "label": {"type": "plain_text", "text": "Your Name"},
                     "element": {"type": "plain_text_input", "action_id": "name_input"}
                 },
-                # Discipline
                 {
                     "type": "input",
                     "block_id": "discipline",
-                    "label": {"type": "plain_text", "text": "Discipline"},
+                    "label": {"type": "plain_text", "text": "Discipline (ID/ME/EE)"},
                     "element": {
                         "type": "static_select",
                         "action_id": "discipline_input",
                         "options": [
-                            {"text": {"type": "plain_text", "text": "Industrial Design"}, "value": "Industrial Design"},
-                            {"text": {"type": "plain_text", "text": "Mechanical Engineering"}, "value": "Mechanical Engineering"},
-                            {"text": {"type": "plain_text", "text": "Electrical Engineering"}, "value": "Electrical Engineering"},
-                            {"text": {"type": "plain_text", "text": "Firmware"}, "value": "Firmware"},
-                            {"text": {"type": "plain_text", "text": "Manufacturing"}, "value": "Manufacturing"},
-                            {"text": {"type": "plain_text", "text": "Prototyping"}, "value": "Prototyping"},
+                            {"text": {"type": "plain_text", "text": "ID"}, "value": "ID"},
+                            {"text": {"type": "plain_text", "text": "ME"}, "value": "ME"},
+                            {"text": {"type": "plain_text", "text": "EE"}, "value": "EE"},
                         ]
                     }
                 },
-                # The four questions
                 *[
                     {
                         "type": "input",
@@ -162,7 +169,7 @@ def slack_command():
                     for blk, txt in [
                         ("progress", "What was worked on, what progress was made?"),
                         ("challenges", "Challenges, unexpected items, or timing issues?"),
-                        ("feedback", "Are there any areas where we need feedback from the customer?"),
+                        ("feedback", "Areas where we need customer feedback?"),
                         ("next_steps", "Next Steps:")
                     ]
                 ]
@@ -173,7 +180,7 @@ def slack_command():
 
 @app.route("/slack/interact", methods=["POST"])
 def slack_interact():
-    """Handle modal submission: write to Doc + post to Slack."""
+    """Handle modal submission: update Doc + post to Slack."""
     payload = json.loads(request.form["payload"])
     if payload.get("type") != "view_submission":
         return "", 200
@@ -188,18 +195,13 @@ def slack_interact():
     feedback     = vals["feedback"]["feedback_input"]["value"]
     next_steps   = vals["next_steps"]["next_steps_input"]["value"]
 
-    # Find or create the Google Doc for this project
-    doc_id = find_doc_id_by_title(project_name)
-    if not doc_id:
-        doc_id = copy_project_doc(project_name)
-
-    # Append the new update row
+    doc_id = find_doc_id_by_title(project_name) or copy_project_doc(project_name)
     append_update_to_doc(doc_id, [name, discipline, progress, challenges, feedback, next_steps])
 
-    # Post back to Slack
-    monday_str = (datetime.now() - timedelta(days=datetime.now().weekday())).strftime("%B %d, %Y")
+    week_of = (datetime.now() - timedelta(days=datetime.now().weekday())) \
+              .strftime("%B %d, %Y")
     slack_msg = (
-        f"*Weekly Update – {project_name} (Week of {monday_str})*\n"
+        f"*Weekly Update – {project_name} (Week of {week_of})*\n"
         f"> *Name:* {name}\n"
         f"> *Discipline:* {discipline}\n"
         f"> *Progress:* {progress}\n"
