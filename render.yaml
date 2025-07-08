@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: statusbot
+    env: python
+    plan: hobby
+    buildCommand: ""
+    startCommand: python app.py
