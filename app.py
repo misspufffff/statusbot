@@ -67,26 +67,34 @@ app = Flask(__name__)
 # Caches the full list of Harvest project names in memory
 HARVEST_PROJECTS = []
 
-def load_all_harvest_projects():
-    global HARVEST_PROJECTS
-    harvest_url = "https://api.harvestapp.com/v2/projects"
-    headers = {
-        "Harvest-Account-Id": os.environ["HARVEST_ACCOUNT_ID"],
-        "Authorization":      f"Bearer {os.environ['HARVEST_ACCESS_TOKEN']}",
-        "User-Agent":         "StatusBot (mclaypoole@kickrdesign.com)"
-    }
-    projects = []
-    page = 1
-    while True:
-        r = requests.get(harvest_url, headers=headers,
-                         params={"page": page, "per_page": 100})
-        r.raise_for_status()
-        data = r.json()
-        projects.extend([p["name"] for p in data.get("projects", [])])
-        if not data.get("next_page"):
-            break
-        page += 1
-    HARVEST_PROJECTS = projects
+ def load_all_harvest_projects():
+     """Fetch every Harvest project name, paging 100 at a time."""
+     harvest_url = "https://api.harvestapp.com/v2/projects"
+     headers = {
+         "Harvest-Account-Id": os.environ["HARVEST_ACCOUNT_ID"],
+         "Authorization":      f"Bearer {os.environ['HARVEST_ACCESS_TOKEN']}",
+         "User-Agent":         "StatusBot (you@example.com)"
+     }
+     names = []
+     page = 1
+     while True:
+         r = requests.get(
+             harvest_url, headers=headers,
+             params={"page": page, "per_page": 100}
+         )
+         r.raise_for_status()
+         data = r.json()
+-        names.extend(p["name"] for p in data.get("projects", []))
++        # only include active projects
++        names.extend(
++            p["name"]
++            for p in data.get("projects", [])
++            if p.get("is_active", False)
++        )
+         if not data.get("next_page"):
+             break
+         page += 1
+     return names
 
 @app.before_request
 def init_projects():
