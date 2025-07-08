@@ -2,3 +2,4 @@ Flask
 slack_sdk
 google-api-python-client
 google-auth
+requests
