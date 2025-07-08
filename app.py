@@ -36,11 +36,12 @@ def find_doc_id_by_title(title):
 
 def copy_project_doc(title):
     body = {"name": title}
-    # body["parents"] = [PARENT_FOLDER_ID]  # if you want a folder
+    # body["parents"] = [PARENT_FOLDER_ID]  # if you want to organize copies in a folder
     new = drive_service.files().copy(fileId=TEMPLATE_DOC_ID, body=body).execute()
     return new["id"]
 
 def append_update_to_doc(doc_id, cells):
+    # Insert a new row below the header (rowIndex=1) and fill with cells
     requests = [
         {
             "insertTableRow": {
@@ -60,7 +61,8 @@ def append_update_to_doc(doc_id, cells):
             }
         })
     docs_service.documents().batchUpdate(
-        documentId=doc_id, body={"requests": requests}
+        documentId=doc_id,
+        body={"requests": requests}
     ).execute()
 
 # ─── Flask App & Slack Endpoints ──────────────────────────────────────────────
@@ -68,27 +70,31 @@ app = Flask(__name__)
 
 @app.route("/slack/command", methods=["POST"])
 def slack_command():
-    """Slash command: /weekly-update → open a modal."""
+    """Slash command: /weekly-update → open a modal with all Harvest projects."""
     trigger_id = request.form["trigger_id"]
     channel_id = request.form["channel_id"]
 
-    # Fetch Harvest projects
+    # Paginate through Harvest projects (up to any number)
     harvest_url = "https://api.harvestapp.com/v2/projects"
     headers = {
         "Harvest-Account-Id": os.environ["HARVEST_ACCOUNT_ID"],
         "Authorization":      f"Bearer {os.environ['HARVEST_ACCESS_TOKEN']}",
         "User-Agent":         "StatusBot (mclaypoole@kickrdesign.com)"
     }
-    resp = requests.get(harvest_url, headers=headers)
-    resp.raise_for_status()
-    projects = resp.json().get("projects", [])
+    projects = []
+    page = 1
+    while True:
+        resp = requests.get(harvest_url, headers=headers, params={"page": page, "per_page": 100})
+        resp.raise_for_status()
+        data = resp.json()
+        projects.extend(data.get("projects", []))
+        if not data.get("next_page"):
+            break
+        page += 1
 
     project_options = [
-        {
-            "text":  {"type": "plain_text", "text": proj["name"]},
-            "value": proj["name"]
-        }
-        for proj in projects
+        {"text": {"type": "plain_text", "text": p["name"]}, "value": p["name"]}
+        for p in projects
     ]
 
     slack.views_open(
@@ -101,6 +107,7 @@ def slack_command():
             "submit": {"type": "plain_text", "text": "Submit"},
             "close": {"type": "plain_text", "text": "Cancel"},
             "blocks": [
+                # Project selector
                 {
                     "type": "input",
                     "block_id": "project",
@@ -111,6 +118,7 @@ def slack_command():
                         "options": project_options
                     }
                 },
+                # Week-of-Monday header (display only)
                 {
                     "type": "section",
                     "text": {
@@ -118,26 +126,32 @@ def slack_command():
                         "text": f"*Week of {(datetime.now() - timedelta(days=datetime.now().weekday())).strftime('%B %d, %Y')}*"
                     }
                 },
+                # Your Name
                 {
                     "type": "input",
                     "block_id": "name",
                     "label": {"type": "plain_text", "text": "Your Name"},
                     "element": {"type": "plain_text_input", "action_id": "name_input"}
                 },
+                # Discipline
                 {
                     "type": "input",
                     "block_id": "discipline",
-                    "label": {"type": "plain_text", "text": "Discipline (ID/ME/EE)"},
+                    "label": {"type": "plain_text", "text": "Discipline"},
                     "element": {
                         "type": "static_select",
                         "action_id": "discipline_input",
                         "options": [
-                            {"text": {"type": "plain_text", "text": "ID"}, "value": "ID"},
-                            {"text": {"type": "plain_text", "text": "ME"}, "value": "ME"},
-                            {"text": {"type": "plain_text", "text": "EE"}, "value": "EE"},
+                            {"text": {"type": "plain_text", "text": "Industrial Design"}, "value": "Industrial Design"},
+                            {"text": {"type": "plain_text", "text": "Mechanical Engineering"}, "value": "Mechanical Engineering"},
+                            {"text": {"type": "plain_text", "text": "Electrical Engineering"}, "value": "Electrical Engineering"},
+                            {"text": {"type": "plain_text", "text": "Firmware"}, "value": "Firmware"},
+                            {"text": {"type": "plain_text", "text": "Manufacturing"}, "value": "Manufacturing"},
+                            {"text": {"type": "plain_text", "text": "Prototyping"}, "value": "Prototyping"},
                         ]
                     }
                 },
+                # The four questions
                 *[
                     {
                         "type": "input",
@@ -161,7 +175,7 @@ def slack_command():
 def slack_interact():
     """Handle modal submission: write to Doc + post to Slack."""
     payload = json.loads(request.form["payload"])
-    if payload["type"] != "view_submission":
+    if payload.get("type") != "view_submission":
         return "", 200
 
     vals = payload["view"]["state"]["values"]
@@ -174,15 +188,18 @@ def slack_interact():
     feedback     = vals["feedback"]["feedback_input"]["value"]
     next_steps   = vals["next_steps"]["next_steps_input"]["value"]
 
+    # Find or create the Google Doc for this project
     doc_id = find_doc_id_by_title(project_name)
     if not doc_id:
         doc_id = copy_project_doc(project_name)
 
+    # Append the new update row
     append_update_to_doc(doc_id, [name, discipline, progress, challenges, feedback, next_steps])
 
-    monday_str = (datetime.now() - timedelta(days=datetime.now().weekday())).strftime("Week of %B %d, %Y")
+    # Post back to Slack
+    monday_str = (datetime.now() - timedelta(days=datetime.now().weekday())).strftime("%B %d, %Y")
     slack_msg = (
-        f"*Weekly Update – {project_name} ({monday_str})*\n"
+        f"*Weekly Update – {project_name} (Week of {monday_str})*\n"
         f"> *Name:* {name}\n"
         f"> *Discipline:* {discipline}\n"
         f"> *Progress:* {progress}\n"
