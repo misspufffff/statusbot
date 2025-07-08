@@ -1,127 +1,228 @@
+import os
+import json
 from flask import Flask, request
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 from datetime import datetime, timedelta
-import os
-import json
+from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
 
-SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")
-client = WebClient(token=SLACK_BOT_TOKEN)
+# ─── Slack Client ─────────────────────────────────────────────────────────────
+
+SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
+slack = WebClient(token=SLACK_BOT_TOKEN)
+
+# ─── Google API Clients ───────────────────────────────────────────────────────
+
+# Load your service account key (mounted by Render as a secret file)
+with open("service-account.json") as f:
+    sa_info = json.load(f)
+
+SCOPES = [
+    "https://www.googleapis.com/auth/drive",
+    "https://www.googleapis.com/auth/documents",
+]
+creds = Credentials.from_service_account_info(sa_info, scopes=SCOPES)
+drive_service = build("drive", "v3", credentials=creds)
+docs_service  = build("docs", "v1", credentials=creds)
+
+# The ID of your template doc (set this in Render’s env vars)
+TEMPLATE_DOC_ID = os.environ["TEMPLATE_DOC_ID"]
+# (Optional) a parent folder ID if you want all copies in one folder:
+# PARENT_FOLDER_ID = os.environ.get("PARENT_FOLDER_ID")
+
+
+# ─── Drive/Docs Helper Functions ─────────────────────────────────────────────
+
+def find_doc_id_by_title(title):
+    """Search Drive for a Google Doc named exactly `title`."""
+    q = f"name = '{title}' and mimeType = 'application/vnd.google-apps.document'"
+    resp = drive_service.files().list(q=q, fields="files(id)").execute()
+    files = resp.get("files", [])
+    return files[0]["id"] if files else None
+
+def copy_project_doc(title):
+    """Copy the template and name it `title`, return new doc’s ID."""
+    body = {"name": title}
+    # If you want to put it into a specific folder:
+    # body["parents"] = [PARENT_FOLDER_ID]
+    new = drive_service.files().copy(fileId=TEMPLATE_DOC_ID, body=body).execute()
+    return new["id"]
+
+def append_update_to_doc(doc_id, cells):
+    """
+    Insert a new row at rowIndex=1 (below header) and fill with `cells` list.
+    `cells` should match the table’s number of columns.
+    """
+    requests = [
+        {
+            "insertTableRow": {
+                "tableCellLocation": {
+                    "tableStartLocation": {"index": 1},
+                    "rowIndex": 1
+                },
+                "insertBelow": True
+            }
+        }
+    ]
+    # For each cell, insertText into the newly created empty cell:
+    for i, text in enumerate(cells):
+        requests.append({
+            "insertText": {
+                "location": {
+                    "index": None,       # Docs API will place at start of cell
+                    "segmentId": ""
+                },
+                "text": text
+            }
+        })
+    docs_service.documents().batchUpdate(
+        documentId=doc_id,
+        body={"requests": requests}
+    ).execute()
+
+
+# ─── Flask App & Slack Endpoints ──────────────────────────────────────────────
 
 app = Flask(__name__)
 
 @app.route("/slack/command", methods=["POST"])
 def slack_command():
-    try:
-        trigger_id = request.form.get("trigger_id")
-        channel_id = request.form.get("channel_id")
+    """Slash command: /weekly-update → open a modal."""
+    trigger_id = request.form["trigger_id"]
+    channel_id = request.form["channel_id"]
 
-        # Get current week's Monday
-        today = datetime.now()
-        monday = today - timedelta(days=today.weekday())
-        monday_str = monday.strftime("Week of %B %d, %Y")
+    # TODO: Replace this static list with a real Harvest API call
+    harvest_projects = [
+        {"name": "Project Alpha"},
+        {"name": "Project Beta"},
+        {"name": "Project Gamma"},
+    ]
+    project_options = [
+        {
+            "text": {"type": "plain_text", "text": p["name"]},
+            "value": p["name"]
+        }
+        for p in harvest_projects
+    ]
 
-        # Open modal
-        client.views_open(
-            trigger_id=trigger_id,
-            view={
-                "type": "modal",
-                "callback_id": "weekly_update",
-                "private_metadata": channel_id,
-                "title": {"type": "plain_text", "text": f"Weekly Update"},
-                "submit": {"type": "plain_text", "text": "Submit"},
-                "close": {"type": "plain_text", "text": "Cancel"},
-                "blocks": [
-                    {
-                        "type": "section",
-                        "text": {"type": "mrkdwn", "text": f"*Weekly Update – {monday_str}*"},
-                    },
+    slack.views_open(
+        trigger_id=trigger_id,
+        view={
+            "type": "modal",
+            "callback_id": "weekly_update",
+            "private_metadata": channel_id,
+            "title": {"type": "plain_text", "text": "Weekly Update"},
+            "submit": {"type": "plain_text", "text": "Submit"},
+            "close": {"type": "plain_text", "text": "Cancel"},
+            "blocks": [
+                # Project selector
+                {
+                    "type": "input",
+                    "block_id": "project",
+                    "label": {"type": "plain_text", "text": "Project"},
+                    "element": {
+                        "type": "static_select",
+                        "action_id": "project_select",
+                        "options": project_options
+                    }
+                },
+                # Week of Monday header (display only)
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"*Week of { (datetime.now() - timedelta(days=datetime.now().weekday())).strftime('%B %d, %Y') }*"
+                    }
+                },
+                # Your Name
+                {
+                    "type": "input",
+                    "block_id": "name",
+                    "label": {"type": "plain_text", "text": "Your Name"},
+                    "element": {"type": "plain_text_input", "action_id": "name_input"}
+                },
+                # Discipline
+                {
+                    "type": "input",
+                    "block_id": "discipline",
+                    "label": {"type": "plain_text", "text": "Discipline (ID/ME/EE)"},
+                    "element": {
+                        "type": "static_select",
+                        "action_id": "discipline_input",
+                        "options": [
+                            {"text": {"type": "plain_text", "text": "ID"}, "value": "ID"},
+                            {"text": {"type": "plain_text", "text": "ME"}, "value": "ME"},
+                            {"text": {"type": "plain_text", "text": "EE"}, "value": "EE"},
+                        ]
+                    }
+                },
+                # The four questions
+                *[
                     {
                         "type": "input",
-                        "block_id": "name",
-                        "label": {"type": "plain_text", "text": "Your Name"},
-                        "element": {"type": "plain_text_input", "action_id": "name_input"},
-                    },
-                    {
-                        "type": "input",
-                        "block_id": "discipline",
-                        "label": {"type": "plain_text", "text": "Choose your area:"},
-                        "element": {
-                            "type": "static_select",
-                            "action_id": "discipline_input",
-                            "options": [
-                                {"text": {"type": "plain_text", "text": "ID"}, "value": "id"},
-                                {"text": {"type": "plain_text", "text": "ME"}, "value": "me"},
-                                {"text": {"type": "plain_text", "text": "EE"}, "value": "ee"},
-                            ],
-                        },
-                    },
-                    {
-                        "type": "input",
-                        "block_id": "progress",
-                        "label": {"type": "plain_text", "text": "What was worked on, what progress was made?"},
-                        "element": {"type": "plain_text_input", "multiline": True, "action_id": "progress_input"},
-                    },
-                    {
-                        "type": "input",
-                        "block_id": "challenges",
-                        "label": {"type": "plain_text", "text": "Challenges or timing surprises?"},
-                        "element": {"type": "plain_text_input", "multiline": True, "action_id": "challenges_input"},
-                    },
-                    {
-                        "type": "input",
-                        "block_id": "feedback",
-                        "label": {"type": "plain_text", "text": "Need feedback from customer?"},
-                        "element": {"type": "plain_text_input", "multiline": True, "action_id": "feedback_input"},
-                    },
-                    {
-                        "type": "input",
-                        "block_id": "next_steps",
-                        "label": {"type": "plain_text", "text": "Next Steps"},
-                        "element": {"type": "plain_text_input", "multiline": True, "action_id": "steps_input"},
-                    },
-                ],
-            },
-        )
-        return "", 200
+                        "block_id": blk,
+                        "label": {"type": "plain_text", "text": txt},
+                        "element": {"type": "plain_text_input", "multiline": True, "action_id": f"{blk}_input"}
+                    }
+                    for blk, txt in [
+                        ("progress", "What was worked on, what progress was made?"),
+                        ("challenges", "Challenges, unexpected items, or timing issues?"),
+                        ("feedback", "Are there any areas where we need feedback from the customer?"),
+                        ("next_steps", "Next Steps:")
+                    ]
+                ]
+            ]
+        }
+    )
+    return "", 200
 
-    except Exception as e:
-        print("❌ Error in slash_command:", str(e))
-        return "", 200
 
 @app.route("/slack/interact", methods=["POST"])
 def slack_interact():
+    """Handle modal submission: write to Doc + post to Slack."""
+    payload = json.loads(request.form["payload"])
+    if payload["type"] != "view_submission":
+        return "", 200
+
+    vals = payload["view"]["state"]["values"]
+    channel_id   = payload["view"]["private_metadata"]
+    project_name = vals["project"]["project_select"]["selected_option"]["value"]
+    name         = vals["name"]["name_input"]["value"]
+    discipline   = vals["discipline"]["discipline_input"]["selected_option"]["value"]
+    progress     = vals["progress"]["progress_input"]["value"]
+    challenges   = vals["challenges"]["challenges_input"]["value"]
+    feedback     = vals["feedback"]["feedback_input"]["value"]
+    next_steps   = vals["next_steps"]["next_steps_input"]["value"]
+
+    # 1) Look up or create the project doc
+    doc_id = find_doc_id_by_title(project_name)
+    if not doc_id:
+        doc_id = copy_project_doc(project_name)
+
+    # 2) Append a new row
+    append_update_to_doc(doc_id, [name, discipline, progress, challenges, feedback, next_steps])
+
+    # 3) Post a confirmation back to Slack
+    monday_str = (datetime.now() - timedelta(days=datetime.now().weekday())) \
+                  .strftime("Week of %B %d, %Y")
+    slack_msg = (
+        f"*Weekly Update – {project_name} ({monday_str})*\n"
+        f"> *Name:* {name}\n"
+        f"> *Discipline:* {discipline}\n"
+        f"> *Progress:* {progress}\n"
+        f"> *Challenges:* {challenges}\n"
+        f"> *Feedback:* {feedback}\n"
+        f"> *Next Steps:* {next_steps}"
+    )
     try:
-        payload = json.loads(request.form["payload"])
-        values = payload["view"]["state"]["values"]
-        channel_id = payload["view"]["private_metadata"]
+        slack.chat_postMessage(channel=channel_id, text=slack_msg)
+    except SlackApiError as e:
+        print("Slack post error:", e.response["error"])
 
-        today = datetime.now()
-        monday = today - timedelta(days=today.weekday())
-        monday_str = monday.strftime("Week of %B %d, %Y")
+    return "", 200
 
-        name = values["name"]["name_input"]["value"]
-        discipline = values["discipline"]["discipline_input"]["selected_option"]["text"]["text"]
-        progress = values["progress"]["progress_input"]["value"]
-        challenges = values["challenges"]["challenges_input"]["value"]
-        feedback = values["feedback"]["feedback_input"]["value"]
-        next_steps = values["next_steps"]["steps_input"]["value"]
-
-        message = (
-            f"*Weekly Update – {discipline} ({monday_str})*\n"
-            f"> *Name:* {name}\n"
-            f"> *Progress:* {progress}\n"
-            f"> *Challenges:* {challenges}\n"
-            f"> *Feedback Needed:* {feedback}\n"
-            f"> *Next Steps:* {next_steps}"
-        )
-
-        client.chat_postMessage(channel=channel_id, text=message)
-        return "", 200
-
-    except Exception as e:
-        print("❌ Error in slack_interact:", str(e))
-        return "", 200
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+    # Render uses port 10000 by default; adjust if needed
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "10000")))
